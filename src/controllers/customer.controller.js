@@ -159,7 +159,7 @@ exports.create = async (req, res) => {
     } catch (error) {
         await connection.rollback();
         console.error(error);
-        res.status(500).json({ message: "Server error" + error });
+        res.status(500).json({ message: "Server error", error: error });
     } finally {
         connection.release();
     }

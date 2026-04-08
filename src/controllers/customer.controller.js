@@ -79,6 +79,7 @@ function calculateNextDate(start_date, frequency) {
             date.setMonth(date.getMonth() + 1);
             break;
 
+        case "2/Month":
         case "Monthly":
         case "24/Year":
             // every 15 days

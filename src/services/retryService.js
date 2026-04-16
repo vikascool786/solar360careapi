@@ -13,10 +13,15 @@ exports.retryFailedMessages = async () => {
   cl.retry_count,
   cl.response,
   c.message_template,
+  c.whatsapp_account_id,
+  wa.access_token,
+  pn.phone_number_id AS whatsapp_phone_number_id,
   t.*
 FROM campaign_logs cl
 JOIN campaigns c ON cl.campaign_id = c.id
-JOIN templates t ON t.name = c.message_template
+JOIN whatsapp_accounts wa ON wa.id = c.whatsapp_account_id
+JOIN phone_numbers pn ON pn.id = c.phone_number_id
+JOIN templates t ON t.whatsapp_account_id = c.whatsapp_account_id AND t.name = c.message_template
 WHERE cl.status = 'failed'
 AND cl.retry_count < 3
 LIMIT 20
@@ -24,14 +29,15 @@ LIMIT 20
 
   for (let log of logs) {
     try {
+      console.log("log.whatsapp_phone_number_id", log.whatsapp_phone_number_id);
       const payload = buildTemplatePayload(log, log.phone);
 
       const response = await axios.post(
-        `https://graph.facebook.com/v22.0/${process.env.WHATSAPP_PHONE_ID}/messages`,
+        `https://graph.facebook.com/${process.env.FB_API_VERSION}/${log.whatsapp_phone_number_id}/messages`,
         payload,
         {
           headers: {
-            Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}`,
+            Authorization: `Bearer ${log.access_token}`,
             "Content-Type": "application/json",
           },
         },
@@ -70,7 +76,7 @@ LIMIT 20
              last_attempt_at = NOW(),
              response=?
          WHERE id=?`,
-        [JSON.stringify(err.response?.data), log.id],
+        [JSON.stringify(err.response?.data), log.campaign_log_id],
       );
 
       console.log(`❌ Retry failed: ${log.phone}`);

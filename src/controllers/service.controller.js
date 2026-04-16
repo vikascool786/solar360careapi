@@ -1,7 +1,13 @@
 const db = require("../config/db");
+const { requireAuthenticatedUserId } = require("../utils/auth");
+const {
+  calculateNextServiceDate,
+  canScheduleAnotherVisit,
+} = require("../utils/serviceSchedule");
 
 exports.getAllVisits = async (req, res) => {
   try {
+    const userId = requireAuthenticatedUserId(req);
     const page = parseInt(req.query.page) || 1;
     const limit = Math.min(parseInt(req.query.limit) || 10, 100);
     const offset = (page - 1) * limit;
@@ -10,8 +16,17 @@ exports.getAllVisits = async (req, res) => {
     const area = req.query.area || "";
     const status = req.query.status || "pending";
 
-    let where = "WHERE sv.status = ?";
-    let params = [status];
+    let where = "WHERE c.user_id = ?";
+    const params = [userId];
+
+    if (status === "overdue") {
+      where += " AND sv.status = 'pending' AND DATE(sv.next_service_date) < CURDATE()";
+    } else if (status === "pending") {
+      where += " AND sv.status = 'pending' AND DATE(sv.next_service_date) >= CURDATE()";
+    } else if (status) {
+      where += " AND sv.status = ?";
+      params.push(status);
+    }
 
     if (search) {
       where += " AND (c.name LIKE ? OR c.phone LIKE ?)";
@@ -25,23 +40,30 @@ exports.getAllVisits = async (req, res) => {
 
     const [countRows] = await db.query(
       `SELECT COUNT(*) as total
-             FROM service_visits sv
-             JOIN customers c ON c.id = sv.customer_id
-             ${where}`,
+       FROM service_visits sv
+       JOIN customers c ON c.id = sv.customer_id
+       ${where}`,
       params
     );
 
     const [rows] = await db.query(
-      `SELECT 
-                sv.*,
-                c.name,
-                c.phone,
-                c.area
-             FROM service_visits sv
-             JOIN customers c ON c.id = sv.customer_id
-             ${where}
-             ORDER BY sv.next_service_date ASC
-             LIMIT ? OFFSET ?`,
+      `SELECT
+          sv.*,
+          c.name,
+          c.phone,
+          c.area,
+          c.address,
+          c.plan_type,
+          CASE
+            WHEN sv.status = 'pending' AND DATE(sv.next_service_date) < CURDATE()
+            THEN 1
+            ELSE 0
+          END AS is_overdue
+       FROM service_visits sv
+       JOIN customers c ON c.id = sv.customer_id
+       ${where}
+       ORDER BY sv.next_service_date ASC
+       LIMIT ? OFFSET ?`,
       [...params, limit, offset]
     );
 
@@ -51,42 +73,222 @@ exports.getAllVisits = async (req, res) => {
       page,
       limit,
     });
-
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: "Error fetching visits" });
+  } catch (error) {
+    console.error(error);
+    res.status(error.statusCode || 500).json({
+      message: error.message || "Error fetching visits",
+    });
   }
 };
 
-// ✅ 1. CREATE SINGLE SERVICE VISIT (manual/admin)
+exports.generateVisitsFromCustomers = async (req, res) => {
+  const connection = await db.getConnection();
+
+  try {
+    const userId = requireAuthenticatedUserId(req);
+    const customerId = req.body.customer_id || req.query.customer_id || null;
+
+    let customerWhere = `
+      WHERE c.user_id = ?
+        AND COALESCE(c.customer_type, 'customer') = 'customer'
+        AND c.start_date IS NOT NULL
+        AND c.frequency IS NOT NULL
+    `;
+    const customerParams = [userId];
+
+    if (customerId) {
+      customerWhere += " AND c.id = ?";
+      customerParams.push(customerId);
+    }
+
+    const [customers] = await connection.query(
+      `SELECT
+          c.id,
+          c.name,
+          c.start_date,
+          c.next_service_date,
+          c.frequency,
+          COUNT(sv.id) AS total_visits,
+          SUM(CASE WHEN sv.status NOT IN ('completed', 'skipped') THEN 1 ELSE 0 END) AS open_visits
+       FROM customers c
+       LEFT JOIN service_visits sv ON sv.customer_id = c.id
+       ${customerWhere}
+       GROUP BY c.id, c.name, c.start_date, c.next_service_date, c.frequency
+       ORDER BY c.id ASC`,
+      customerParams
+    );
+
+    if (!customers.length) {
+      return res.status(404).json({
+        message: customerId
+          ? "Customer not found or not eligible for scheduling"
+          : "No eligible customers found",
+      });
+    }
+
+    await connection.beginTransaction();
+
+    const summary = {
+      inserted: 0,
+      skipped_existing_open_visit: 0,
+      skipped_missing_next_service_date: 0,
+      skipped_plan_limit_reached: 0,
+      customers: [],
+    };
+
+    for (const customer of customers) {
+      if (Number(customer.open_visits || 0) > 0) {
+        summary.skipped_existing_open_visit += 1;
+        summary.customers.push({
+          customer_id: customer.id,
+          name: customer.name,
+          action: "skipped_existing_open_visit",
+          next_service_date: customer.next_service_date,
+        });
+        continue;
+      }
+
+      const [latestVisitRows] = await connection.query(
+        `SELECT id, status, next_service_date
+         FROM service_visits
+         WHERE customer_id = ?
+         ORDER BY id DESC
+         LIMIT 1`,
+        [customer.id]
+      );
+
+      const latestVisit = latestVisitRows[0] || null;
+      let scheduledDate = null;
+
+      if (latestVisit?.status === "completed" && latestVisit.next_service_date) {
+        scheduledDate = calculateNextServiceDate(
+          latestVisit.next_service_date,
+          customer.frequency
+        );
+      } else if (customer.next_service_date) {
+        scheduledDate = customer.next_service_date;
+      } else if (customer.start_date) {
+        scheduledDate = calculateNextServiceDate(
+          customer.start_date,
+          customer.frequency
+        );
+      }
+
+      if (!scheduledDate) {
+        summary.skipped_missing_next_service_date += 1;
+        summary.customers.push({
+          customer_id: customer.id,
+          name: customer.name,
+          action: "skipped_missing_next_service_date",
+        });
+        continue;
+      }
+
+      const allowed = canScheduleAnotherVisit({
+        frequency: customer.frequency,
+        startDate: customer.start_date,
+        totalVisits: Number(customer.total_visits || 0),
+        candidateDate: scheduledDate,
+      });
+
+      if (!allowed) {
+        await connection.query(
+          `UPDATE customers
+           SET next_service_date = NULL
+           WHERE id = ? AND user_id = ?`,
+          [customer.id, userId]
+        );
+
+        summary.skipped_plan_limit_reached += 1;
+        summary.customers.push({
+          customer_id: customer.id,
+          name: customer.name,
+          action: "skipped_plan_limit_reached",
+        });
+        continue;
+      }
+
+      await connection.query(
+        `INSERT INTO service_visits
+         (customer_id, visit_date, status, next_service_date, reminder_sent)
+         VALUES (?, ?, 'pending', ?, 0)`,
+        [customer.id, null, scheduledDate]
+      );
+      await connection.query(
+        `UPDATE customers
+         SET next_service_date = ?
+         WHERE id = ? AND user_id = ?`,
+        [scheduledDate, customer.id, userId]
+      );
+
+      summary.inserted += 1;
+      summary.customers.push({
+        customer_id: customer.id,
+        name: customer.name,
+        action: "inserted",
+        next_service_date: scheduledDate,
+      });
+    }
+
+    await connection.commit();
+
+    res.json({
+      success: true,
+      message: "Service visits generated from customers",
+      ...summary,
+    });
+  } catch (error) {
+    await connection.rollback();
+    console.error(error);
+    res.status(error.statusCode || 500).json({
+      message: error.message || "Failed to generate service visits",
+    });
+  } finally {
+    connection.release();
+  }
+};
+
 exports.createServiceVisit = async (req, res) => {
   try {
+    const userId = requireAuthenticatedUserId(req);
     const { customer_id, next_service_date } = req.body;
 
+    const [[customer]] = await db.query(
+      "SELECT id FROM customers WHERE id = ? AND user_id = ? LIMIT 1",
+      [customer_id, userId]
+    );
+
+    if (!customer) {
+      return res.status(404).json({ error: "Customer not found" });
+    }
+
     await db.query(
-      `INSERT INTO service_visits 
-       (customer_id, next_service_date, reminder_sent) 
+      `INSERT INTO service_visits
+       (customer_id, next_service_date, reminder_sent)
        VALUES (?, ?, 0)`,
       [customer_id, next_service_date]
     );
 
     res.json({ success: true, message: "Service visit created" });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Failed to create service visit" });
+  } catch (error) {
+    console.error(error);
+    res.status(error.statusCode || 500).json({
+      error: error.message || "Failed to create service visit",
+    });
   }
 };
 
-
-// ✅ 2. COMPLETE SERVICE → AUTO CREATE NEXT VISIT
 exports.completeService = async (req, res) => {
   try {
-    const { id } = req.params; // service_visit_id
+    const userId = requireAuthenticatedUserId(req);
+    const { id } = req.params;
 
-    // 1. Get visit
     const [visits] = await db.query(
-      `SELECT * FROM service_visits WHERE id = ?`,
-      [id]
+      `SELECT sv.*
+       FROM service_visits sv
+       JOIN customers c ON c.id = sv.customer_id
+       WHERE sv.id = ? AND c.user_id = ?`,
+      [id, userId]
     );
 
     if (!visits.length) {
@@ -99,83 +301,97 @@ exports.completeService = async (req, res) => {
       return res.status(400).json({ message: "Already completed" });
     }
 
-    // 2. Get customer
     const [customers] = await db.query(
-      `SELECT * FROM customers WHERE id = ?`,
-      [visit.customer_id]
+      `SELECT * FROM customers WHERE id = ? AND user_id = ?`,
+      [visit.customer_id, userId]
     );
 
     const customer = customers[0];
 
-    // 3. Mark visit completed
     await db.query(
       `UPDATE service_visits
        SET status = 'completed',
-           visit_date = NOW()
+           visit_date = CURDATE()
        WHERE id = ?`,
       [id]
     );
 
-    // 4. Calculate next date
-    const nextDate = new Date(visit.next_service_date);
-
-    switch (customer.frequency) {
-      case "Monthly":
-        nextDate.setMonth(nextDate.getMonth() + 1);
-        break;
-      case "1/Month":
-        nextDate.setDate(nextDate.getDate() + 30);
-        break;
-      case "2/Month":
-      case "24/Year":
-        nextDate.setDate(nextDate.getDate() + 15);
-        break;
-      default:
-        throw new Error("Invalid frequency");
-    }
-
-    // 5. Insert next visit
-    await db.query(
-      `INSERT INTO service_visits
-       (customer_id, visit_date, status, next_service_date, reminder_sent)
-       VALUES (?, ?, 'pending', ?, 0)`,
-      [customer.id, nextDate, nextDate]
+    const nextDate = calculateNextServiceDate(
+      visit.next_service_date,
+      customer.frequency
+    );
+    const [[visitCountRow]] = await db.query(
+      `SELECT COUNT(*) AS total_visits
+       FROM service_visits
+       WHERE customer_id = ?`,
+      [customer.id]
     );
 
-    // 6. Update customer
+    const [openRows] = await db.query(
+      `SELECT id
+       FROM service_visits
+       WHERE customer_id = ?
+         AND status NOT IN ('completed', 'skipped')
+       LIMIT 1`,
+      [customer.id]
+    );
+
+    const shouldCreateNextVisit =
+      !openRows.length &&
+      canScheduleAnotherVisit({
+        frequency: customer.frequency,
+        startDate: customer.start_date,
+        totalVisits: Number(visitCountRow.total_visits || 0),
+        candidateDate: nextDate,
+      });
+
+    if (shouldCreateNextVisit) {
+      await db.query(
+        `INSERT INTO service_visits
+         (customer_id, visit_date, status, next_service_date, reminder_sent)
+         VALUES (?, ?, 'pending', ?, 0)`,
+        [customer.id, null, nextDate]
+      );
+    }
+
     await db.query(
       `UPDATE customers
        SET next_service_date = ?
-       WHERE id = ?`,
-      [nextDate, customer.id]
+       WHERE id = ? AND user_id = ?`,
+      [shouldCreateNextVisit ? nextDate : null, customer.id, userId]
     );
 
     res.json({
       success: true,
-      message: "Service completed & next visit scheduled",
-      next_service_date: nextDate,
+      message: shouldCreateNextVisit
+        ? "Service completed and next visit scheduled"
+        : "Service completed and plan limit reached",
+      next_service_date: shouldCreateNextVisit ? nextDate : null,
     });
-
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Failed to complete service" });
+  } catch (error) {
+    console.error(error);
+    res.status(error.statusCode || 500).json({
+      error: error.message || "Failed to complete service",
+    });
   }
 };
 
-// ✅ RESCHEDULE SERVICE
 exports.rescheduleService = async (req, res) => {
   try {
-    const { id } = req.params; // service_visit_id
+    const userId = requireAuthenticatedUserId(req);
+    const { id } = req.params;
     const { next_service_date } = req.body;
 
     if (!next_service_date) {
       return res.status(400).json({ message: "Date is required" });
     }
 
-    // 1. Get visit
     const [visits] = await db.query(
-      `SELECT * FROM service_visits WHERE id = ?`,
-      [id]
+      `SELECT sv.*
+       FROM service_visits sv
+       JOIN customers c ON c.id = sv.customer_id
+       WHERE sv.id = ? AND c.user_id = ?`,
+      [id, userId]
     );
 
     if (!visits.length) {
@@ -190,21 +406,18 @@ exports.rescheduleService = async (req, res) => {
       });
     }
 
-    // 2. Update service_visits
     await db.query(
       `UPDATE service_visits
-       SET next_service_date = ?,
-           visit_date = ?
+       SET next_service_date = ?
        WHERE id = ?`,
-      [next_service_date, next_service_date, id]
+      [next_service_date, id]
     );
 
-    // 3. Update customer
     await db.query(
       `UPDATE customers
        SET next_service_date = ?
-       WHERE id = ?`,
-      [next_service_date, visit.customer_id]
+       WHERE id = ? AND user_id = ?`,
+      [next_service_date, visit.customer_id, userId]
     );
 
     res.json({
@@ -212,52 +425,74 @@ exports.rescheduleService = async (req, res) => {
       message: "Service rescheduled successfully",
       next_service_date,
     });
-
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Failed to reschedule service" });
+  } catch (error) {
+    console.error(error);
+    res.status(error.statusCode || 500).json({
+      error: error.message || "Failed to reschedule service",
+    });
   }
 };
 
-// ✅ 3. CREATE PLAN VISITS (AUTO SCHEDULING 🔥)
 exports.createPlanVisits = async (req, res) => {
   try {
+    const userId = requireAuthenticatedUserId(req);
     const { customer_id, visits, interval_days } = req.body;
 
-    for (let i = 1; i <= visits; i++) {
-      let nextDate = new Date();
+    const [[customer]] = await db.query(
+      "SELECT id FROM customers WHERE id = ? AND user_id = ? LIMIT 1",
+      [customer_id, userId]
+    );
+
+    if (!customer) {
+      return res.status(404).json({ error: "Customer not found" });
+    }
+
+    for (let i = 1; i <= visits; i += 1) {
+      const nextDate = new Date();
       nextDate.setDate(nextDate.getDate() + i * interval_days);
 
       await db.query(
-        `INSERT INTO service_visits 
-         (customer_id, next_service_date, reminder_sent) 
+        `INSERT INTO service_visits
+         (customer_id, next_service_date, reminder_sent)
          VALUES (?, ?, 0)`,
         [customer_id, nextDate]
       );
     }
 
     res.json({ success: true, message: "Plan visits scheduled" });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Failed to create plan visits" });
+  } catch (error) {
+    console.error(error);
+    res.status(error.statusCode || 500).json({
+      error: error.message || "Failed to create plan visits",
+    });
   }
 };
 
-// ✅ 4. GET SERVICE VISITS (for UI)
 exports.getServiceVisits = async (req, res) => {
   try {
+    const userId = requireAuthenticatedUserId(req);
     const { customer_id } = req.params;
 
     const [rows] = await db.query(
-      `SELECT * FROM service_visits 
-       WHERE customer_id = ? 
-       ORDER BY next_service_date ASC`,
-      [customer_id]
+      `SELECT sv.*
+            ,
+            CASE
+              WHEN sv.status = 'pending' AND DATE(sv.next_service_date) < CURDATE()
+              THEN 1
+              ELSE 0
+            END AS is_overdue
+       FROM service_visits sv
+       JOIN customers c ON c.id = sv.customer_id
+       WHERE sv.customer_id = ? AND c.user_id = ?
+       ORDER BY sv.next_service_date ASC`,
+      [customer_id, userId]
     );
 
     res.json(rows);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Failed to fetch visits" });
+  } catch (error) {
+    console.error(error);
+    res.status(error.statusCode || 500).json({
+      error: error.message || "Failed to fetch visits",
+    });
   }
 };

@@ -1,11 +1,17 @@
-const express = require('express');
-const cors = require('cors');
-require('dotenv').config();
+const express = require("express");
+const cors = require("cors");
+const path = require("path");
+const http = require("http");
+const { initializeSocket } = require("./socket");
+const { buildCorsOptions } = require("./config/cors");
+require("dotenv").config();
 
 const app = express();
+const server = http.createServer(app);
 
-app.use(cors());
+app.use(cors(buildCorsOptions()));
 app.use(express.json());
+app.use("/uploads", express.static(path.join(process.cwd(), "uploads")));
 
 app.get('/', (req, res) => {
   res.send('Solar360Care CRM API running');
@@ -21,12 +27,15 @@ app.use("/api/webhook", require("./routes/webhook.routes"));
 app.use("/api/inbox", require("./routes/inbox.routes"));
 app.use("/api/campaigns", require("./routes/campaign.routes"));
 app.use("/api/templates", require("./routes/template.routes"));
+app.use("/api/debug", require("./routes/debug.routes"));
 
 // cron job running
 require('./services/reminderService'); // start the reminder service
 
 const PORT = process.env.PORT || 5004;
 
-app.listen(PORT, () => {
+initializeSocket(server);
+
+server.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });

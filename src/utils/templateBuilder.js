@@ -33,7 +33,7 @@ function buildTemplatePayload(template, phone, bodyParams = []) {
     type: "template",
     template: {
       name: template.name,
-      language: { code: "en" },
+      language: { code: template.language || "en_US" },
       components,
     },
   };

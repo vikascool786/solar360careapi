@@ -46,7 +46,7 @@ cron.schedule("57 23 * * *", async () => {
     for (const r of rows) {
       try {
         await axios.post(
-          `https://graph.facebook.com/v22.0/${process.env.WHATSAPP_PHONE_ID}/messages`,
+          `https://graph.facebook.com/${process.env.FB_API_VERSION}/${process.env.WHATSAPP_PHONE_ID}/messages`,
           {
             messaging_product: "whatsapp",
             to: r.phone,

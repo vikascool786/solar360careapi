@@ -5,16 +5,33 @@ const { buildTemplatePayload } = require("../utils/templateBuilder");
 exports.processCampaign = async (campaignId) => {
     console.log("🚀 Processing campaign:", campaignId);
 
-    // 🔥 get campaign + template
+    // get campaign + sender info
     const [[campaign]] = await db.query(
-        "SELECT * FROM campaigns WHERE id=?",
+        `SELECT
+            c.*,
+            wa.access_token,
+            pn.phone_number_id AS whatsapp_phone_number_id
+        FROM campaigns c
+        JOIN whatsapp_accounts wa ON wa.id = c.whatsapp_account_id
+        JOIN phone_numbers pn ON pn.id = c.phone_number_id
+        WHERE c.id=?`,
         [campaignId]
     );
 
+    if (!campaign) {
+        throw new Error(`Campaign ${campaignId} not found`);
+    }
+
     const [[template]] = await db.query(
-        "SELECT * FROM templates WHERE name=?",
-        [campaign.message_template]
+        "SELECT * FROM templates WHERE whatsapp_account_id=? AND name=?",
+        [campaign.whatsapp_account_id, campaign.message_template]
     );
+
+    if (!template) {
+        throw new Error(
+            `Template ${campaign.message_template} not found for tenant ${campaign.whatsapp_account_id}`
+        );
+    }
 
     const [logs] = await db.query(
         "SELECT * FROM campaign_logs WHERE campaign_id=? AND status='pending'",
@@ -28,11 +45,11 @@ exports.processCampaign = async (campaignId) => {
             const payload = buildTemplatePayload(template, log.phone);
 
             const response = await axios.post(
-                `https://graph.facebook.com/v22.0/${process.env.WHATSAPP_PHONE_ID}/messages`,
+                `https://graph.facebook.com/${process.env.FB_API_VERSION}/${campaign.whatsapp_phone_number_id}/messages`,
                 payload,
                 {
                     headers: {
-                        Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}`,
+                        Authorization: `Bearer ${campaign.access_token}`,
                         "Content-Type": "application/json",
                     },
                 }

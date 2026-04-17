@@ -30,6 +30,7 @@ exports.getEnvironmentVariables = (req, res) => {
         .length,
       missingKeys: declaredKeys.filter((key) => process.env[key] === undefined),
       env: envValues,
+      test: "testt"
     });
   } catch (error) {
     console.error("ENV DEBUG ERROR:", error);

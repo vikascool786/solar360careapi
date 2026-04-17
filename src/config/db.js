@@ -4,7 +4,7 @@ const pool = mysql.createPool({
   host: "localhost",
   user: "admin",
   password: "Poonam#@#1988",
-  database: "solar_crm",
+  database: "solar360crm",
 
   waitForConnections: true,
   connectionLimit: 10,

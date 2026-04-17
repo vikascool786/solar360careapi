@@ -4,7 +4,7 @@ const path = require("path");
 const http = require("http");
 const { initializeSocket } = require("./socket");
 const { buildCorsOptions } = require("./config/cors");
-// require("dotenv").config();
+require("dotenv").config();
 
 const app = express();
 const server = http.createServer(app);

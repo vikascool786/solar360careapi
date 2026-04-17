@@ -1,6 +1,6 @@
 const fs = require("fs");
 const path = require("path");
-const dotenv = require("dotenv");
+// const dotenv = require("dotenv");
 
 function getDeclaredEnvKeys() {
   const envPath = path.join(process.cwd(), ".env");

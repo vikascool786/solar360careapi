@@ -5,7 +5,10 @@ const FREQUENCY_RULES = {
   "14/Year": { intervalDays: 26, annualLimit: 14 },
   "12/Year": { intervalDays: 30, annualLimit: 12 },
   "6/Year": { intervalDays: 60, annualLimit: 6 },
-  Monthly: { intervalDays: 15, annualLimit: null },
+};
+
+const FREQUENCY_ALIASES = {
+  Monthly: "1/Month",
 };
 
 function parseDateValue(value) {
@@ -32,13 +35,21 @@ function addDays(dateValue, days) {
 }
 
 function getFrequencyRule(frequency) {
-  const rule = FREQUENCY_RULES[frequency];
+  const rule = FREQUENCY_RULES[normalizeFrequency(frequency)];
 
   if (!rule) {
     throw new Error(`Invalid frequency: ${frequency}`);
   }
 
   return rule;
+}
+
+function normalizeFrequency(frequency) {
+  if (!frequency) {
+    return frequency;
+  }
+
+  return FREQUENCY_ALIASES[frequency] || frequency;
 }
 
 function calculateNextServiceDate(baseDate, frequency) {
@@ -92,5 +103,6 @@ module.exports = {
   getFrequencyRule,
   getPlanEndDate,
   isPlanLimited,
+  normalizeFrequency,
   parseDateValue,
 };

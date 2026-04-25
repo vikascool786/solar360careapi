@@ -1,6 +1,17 @@
 const db = require("../config/db");
 const { requireAuthenticatedUserId } = require("../utils/auth");
-const { calculateNextServiceDate } = require("../utils/serviceSchedule");
+const {
+  calculateNextServiceDate,
+  normalizeFrequency,
+} = require("../utils/serviceSchedule");
+
+function getCustomerCategory(body) {
+  return body.customer_category ?? body["customer_category "] ?? null;
+}
+
+function resolveCustomerType(body) {
+  return body.customer_type || "customer";
+}
 
 exports.getAll = async (req, res) => {
   try {
@@ -66,6 +77,29 @@ exports.getAll = async (req, res) => {
   }
 };
 
+exports.getById = async (req, res) => {
+  try {
+    const userId = requireAuthenticatedUserId(req);
+    const { id } = req.params;
+
+    const [rows] = await db.query(
+      "SELECT * FROM customers WHERE id = ? AND user_id = ? LIMIT 1",
+      [id, userId]
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({ message: "Customer not found" });
+    }
+
+    res.json(rows[0]);
+  } catch (error) {
+    console.error(error);
+    res.status(error.statusCode || 500).json({
+      message: error.message || "Server error",
+    });
+  }
+};
+
 exports.create = async (req, res) => {
   const connection = await db.getConnection();
 
@@ -82,18 +116,21 @@ exports.create = async (req, res) => {
       plan_type,
       plan_price,
       advance_paid,
+      kw = null,
       start_date,
-      frequency,
-      customer_type,
+      frequency: rawFrequency,
     } = req.body;
+    const frequency = normalizeFrequency(rawFrequency);
+    const customer_type = resolveCustomerType(req.body);
+    const customer_category = getCustomerCategory(req.body);
 
     const balance = Number(plan_price) - Number(advance_paid || 0);
     const next_service_date = calculateNextServiceDate(start_date, frequency);
 
     const [result] = await connection.query(
       `INSERT INTO customers
-       (user_id, whatsapp_account_id, name, phone, address, area, plan_type, plan_price, advance_paid, balance, start_date, next_service_date, frequency, customer_type)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       (user_id, whatsapp_account_id, name, phone, address, area, plan_type, plan_price, advance_paid, kw, balance, start_date, next_service_date, frequency, customer_type, customer_category)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         userId,
         whatsapp_account_id,
@@ -104,15 +141,24 @@ exports.create = async (req, res) => {
         plan_type,
         plan_price,
         advance_paid,
+        kw,
         balance,
         start_date,
         next_service_date,
         frequency,
         customer_type,
+        customer_category,
       ]
     );
 
     const customerId = result.insertId;
+
+    await connection.query(
+      `INSERT INTO service_visits
+       (customer_id, visit_date, status, next_service_date, reminder_sent)
+       VALUES (?, ?, 'completed', ?, 0)`,
+      [customerId, start_date, start_date]
+    );
 
     await connection.query(
       `INSERT INTO service_visits
@@ -139,6 +185,7 @@ exports.update = async (req, res) => {
     const userId = requireAuthenticatedUserId(req);
     const { id } = req.params;
     const {
+      whatsapp_account_id = null,
       name,
       phone,
       address,
@@ -146,17 +193,21 @@ exports.update = async (req, res) => {
       plan_type,
       plan_price,
       advance_paid,
+      kw = null,
       start_date,
-      frequency,
-      customer_type,
+      frequency: rawFrequency,
       notes,
     } = req.body;
+    const frequency = normalizeFrequency(rawFrequency);
+    const customer_type = resolveCustomerType(req.body);
+    const customer_category = getCustomerCategory(req.body);
 
     const balance = Number(plan_price) - Number(advance_paid || 0);
     const next_service_date = calculateNextServiceDate(start_date, frequency);
 
     const [customerResult] = await db.query(
       `UPDATE customers SET
+         whatsapp_account_id = ?,
          name = ?,
          phone = ?,
          address = ?,
@@ -164,14 +215,17 @@ exports.update = async (req, res) => {
          plan_type = ?,
          plan_price = ?,
          advance_paid = ?,
+         kw = ?,
          balance = ?,
          start_date = ?,
          next_service_date = ?,
          frequency = ?,
          customer_type = ?,
+         customer_category = ?,
          notes = ?
        WHERE id = ? AND user_id = ?`,
       [
+        whatsapp_account_id,
         name,
         phone,
         address,
@@ -179,11 +233,13 @@ exports.update = async (req, res) => {
         plan_type,
         plan_price,
         advance_paid,
+        kw,
         balance,
         start_date,
         next_service_date,
         frequency,
         customer_type,
+        customer_category,
         notes || null,
         id,
         userId,

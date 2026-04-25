@@ -1,6 +1,6 @@
 const jwt = require("jsonwebtoken");
 
-const JWT_SECRET = process.env.JWT_SECRET || "SECRET_KEY";
+const JWT_SECRET = process.env.JWT_SECRET || "mysecretkey";
 
 function getBearerToken(req) {
   const authHeader = req.headers.authorization || "";

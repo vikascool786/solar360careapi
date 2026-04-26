@@ -15,11 +15,14 @@ exports.getAllVisits = async (req, res) => {
     const search = req.query.search || "";
     const area = req.query.area || "";
     const status = req.query.status || "pending";
+    const orderDirection = status === "all" ? "DESC" : "ASC";
 
     let where = "WHERE c.user_id = ?";
     const params = [userId];
 
-    if (status === "overdue") {
+    if (status === "all") {
+      where += " AND sv.status IN ('pending', 'completed')";
+    } else if (status === "overdue") {
       where += " AND sv.status = 'pending' AND DATE(sv.next_service_date) < CURDATE()";
     } else if (status === "pending") {
       where += " AND sv.status = 'pending' AND DATE(sv.next_service_date) >= CURDATE()";
@@ -62,7 +65,7 @@ exports.getAllVisits = async (req, res) => {
        FROM service_visits sv
        JOIN customers c ON c.id = sv.customer_id
        ${where}
-       ORDER BY sv.next_service_date ASC
+       ORDER BY sv.next_service_date ${orderDirection}
        LIMIT ? OFFSET ?`,
       [...params, limit, offset]
     );

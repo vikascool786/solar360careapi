@@ -1,6 +1,20 @@
 const db = require("../config/db");
 const { requireAuthenticatedUserId } = require("../utils/auth");
 
+async function queryOrFallback(query, params, fallbackQuery, fallbackParams = params) {
+  try {
+    const [[row]] = await db.query(query, params);
+    return row;
+  } catch (error) {
+    if (error.code !== "ER_NO_SUCH_TABLE") {
+      throw error;
+    }
+
+    const [[fallbackRow]] = await db.query(fallbackQuery, fallbackParams);
+    return fallbackRow;
+  }
+}
+
 exports.getDashboardStats = async (req, res) => {
   try {
     const userId = requireAuthenticatedUserId(req);
@@ -30,14 +44,37 @@ exports.getDashboardStats = async (req, res) => {
       [userId]
     );
 
-    const [[totalIncome]] = await db.query(
-      `SELECT SUM(advance_paid) as total FROM customers WHERE user_id = ?`,
+    await db.query(
+      `UPDATE invoices i
+       JOIN customers c ON c.id = i.customer_id
+       SET i.status = 'overdue'
+       WHERE c.user_id = ?
+         AND i.balance > 0
+         AND i.due_date < CURDATE()
+         AND i.status IN ('pending', 'partial')`,
       [userId]
+    ).catch((error) => {
+      if (error.code !== "ER_NO_SUCH_TABLE") {
+        throw error;
+      }
+    });
+
+    const totalIncome = await queryOrFallback(
+      `SELECT COALESCE(SUM(p.amount), 0) as total
+       FROM payments p
+       JOIN customers c ON c.id = p.customer_id
+       WHERE c.user_id = ?`,
+      [userId],
+      `SELECT COALESCE(SUM(advance_paid), 0) as total FROM customers WHERE user_id = ?`
     );
 
-    const [[pendingPayments]] = await db.query(
-      `SELECT SUM(balance) as total FROM customers WHERE user_id = ?`,
-      [userId]
+    const pendingPayments = await queryOrFallback(
+      `SELECT COALESCE(SUM(i.balance), 0) as total
+       FROM invoices i
+       JOIN customers c ON c.id = i.customer_id
+       WHERE c.user_id = ? AND i.balance > 0`,
+      [userId],
+      `SELECT COALESCE(SUM(balance), 0) as total FROM customers WHERE user_id = ?`
     );
 
     const [[activeAMCContracts]] = await db.query(
@@ -56,12 +93,15 @@ exports.getDashboardStats = async (req, res) => {
       [userId]
     );
 
-    const [[pendingInvoices]] = await db.query(
+    const pendingInvoices = await queryOrFallback(
+      `SELECT COUNT(*) as total
+       FROM invoices i
+       JOIN customers c ON c.id = i.customer_id
+       WHERE c.user_id = ? AND i.balance > 0`,
+      [userId],
       `SELECT COUNT(*) as total
        FROM customers
-       WHERE user_id = ?
-       AND balance > 0`,
-      [userId]
+       WHERE user_id = ? AND balance > 0`
     );
 
     const [[totalCampaigns]] = await db.query(
@@ -197,19 +237,42 @@ exports.getUpcomingServices = async (req, res) => {
 exports.getRevenueChart = async (req, res) => {
   try {
     const userId = requireAuthenticatedUserId(req);
-    const [rows] = await db.query(
-      `
-        SELECT
-          DATE_FORMAT(created_at, '%b') as month,
-          SUM(advance_paid) as revenue
-        FROM customers
-        WHERE user_id = ?
-        AND created_at >= DATE_SUB(CURDATE(), INTERVAL 6 MONTH)
-        GROUP BY DATE_FORMAT(created_at, '%Y-%m')
-        ORDER BY MIN(created_at)
-      `,
-      [userId]
-    );
+    let rows;
+
+    try {
+      [rows] = await db.query(
+        `
+          SELECT
+            DATE_FORMAT(p.payment_date, '%b') as month,
+            SUM(p.amount) as revenue
+          FROM payments p
+          JOIN customers c ON c.id = p.customer_id
+          WHERE c.user_id = ?
+          AND p.payment_date >= DATE_SUB(CURDATE(), INTERVAL 6 MONTH)
+          GROUP BY DATE_FORMAT(p.payment_date, '%Y-%m'), DATE_FORMAT(p.payment_date, '%b')
+          ORDER BY MIN(p.payment_date)
+        `,
+        [userId]
+      );
+    } catch (error) {
+      if (error.code !== "ER_NO_SUCH_TABLE") {
+        throw error;
+      }
+
+      [rows] = await db.query(
+        `
+          SELECT
+            DATE_FORMAT(created_at, '%b') as month,
+            SUM(advance_paid) as revenue
+          FROM customers
+          WHERE user_id = ?
+          AND created_at >= DATE_SUB(CURDATE(), INTERVAL 6 MONTH)
+          GROUP BY DATE_FORMAT(created_at, '%Y-%m'), DATE_FORMAT(created_at, '%b')
+          ORDER BY MIN(created_at)
+        `,
+        [userId]
+      );
+    }
 
     res.json(rows);
   } catch (error) {

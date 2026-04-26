@@ -23,6 +23,7 @@ app.use("/api/dashboard", require("./routes/dashboard.routes"));
 app.use('/api/customers', require('./routes/customer.routes'));
 app.use('/api/messages', require('./routes/message.routes'));
 app.use("/api/service-visits", require("./routes/service.routes"));
+app.use("/api/billing", require("./routes/billing.routes"));
 app.use("/api/webhook", require("./routes/webhook.routes"));
 app.use("/api/inbox", require("./routes/inbox.routes"));
 app.use("/api/campaigns", require("./routes/campaign.routes"));

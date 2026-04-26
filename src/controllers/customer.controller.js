@@ -4,6 +4,10 @@ const {
   calculateNextServiceDate,
   normalizeFrequency,
 } = require("../utils/serviceSchedule");
+const {
+  createPlanAndInitialInvoice,
+  syncActivePlanFromCustomer,
+} = require("../services/billing.service");
 
 function getCustomerCategory(body) {
   return body.customer_category ?? body["customer_category "] ?? null;
@@ -30,39 +34,98 @@ exports.getAll = async (req, res) => {
     const safeLimit = Math.min(limit, 100);
     const offset = (page - 1) * safeLimit;
 
-    let where = "WHERE user_id = ?";
+    let where = "WHERE c.user_id = ?";
     const params = [userId];
 
     if (search) {
-      where += " AND (name LIKE ? OR phone LIKE ?)";
+      where += " AND (c.name LIKE ? OR c.phone LIKE ?)";
       params.push(`%${search}%`, `%${search}%`);
     }
 
     if (area) {
-      where += " AND area = ?";
+      where += " AND c.area = ?";
       params.push(area);
     }
 
     if (plan) {
-      where += " AND plan_type = ?";
+      where += " AND c.plan_type = ?";
       params.push(plan);
     }
 
     if (type) {
-      where += " AND customer_category = ?";
+      where += " AND c.customer_category = ?";
       params.push(type);
     }
 
     const [countRows] = await db.query(
-      `SELECT COUNT(*) as total FROM customers ${where}`,
+      `SELECT COUNT(*) as total FROM customers c ${where}`,
       params
     );
     const total = countRows[0].total;
 
     const [rows] = await db.query(
-      `SELECT * FROM customers
+      `SELECT
+         c.*,
+         COALESCE(b.total_balance, 0) AS balance,
+         COALESCE(b.total_paid, 0) AS billing_paid_amount,
+         COALESCE(b.total_amount, 0) AS billing_total_amount,
+         COALESCE(b.total_balance, 0) AS billing_balance,
+         b.current_invoice_id,
+         b.current_invoice_status,
+         b.current_invoice_due_date,
+         b.current_invoice_month
+       FROM customers c
+       LEFT JOIN (
+         SELECT
+           summary.customer_id,
+           SUM(summary.amount) AS total_amount,
+           SUM(summary.paid_amount) AS total_paid,
+           SUM(summary.balance) AS total_balance,
+           (
+             SELECT i2.id
+             FROM invoices i2
+             WHERE i2.customer_id = summary.customer_id
+             ORDER BY
+               CASE WHEN i2.balance > 0 THEN 0 ELSE 1 END,
+               i2.due_date ASC,
+               i2.id ASC
+             LIMIT 1
+           ) AS current_invoice_id,
+           (
+             SELECT i2.status
+             FROM invoices i2
+             WHERE i2.customer_id = summary.customer_id
+             ORDER BY
+               CASE WHEN i2.balance > 0 THEN 0 ELSE 1 END,
+               i2.due_date ASC,
+               i2.id ASC
+             LIMIT 1
+           ) AS current_invoice_status,
+           (
+             SELECT i2.due_date
+             FROM invoices i2
+             WHERE i2.customer_id = summary.customer_id
+             ORDER BY
+               CASE WHEN i2.balance > 0 THEN 0 ELSE 1 END,
+               i2.due_date ASC,
+               i2.id ASC
+             LIMIT 1
+           ) AS current_invoice_due_date,
+           (
+             SELECT i2.invoice_month
+             FROM invoices i2
+             WHERE i2.customer_id = summary.customer_id
+             ORDER BY
+               CASE WHEN i2.balance > 0 THEN 0 ELSE 1 END,
+               i2.due_date ASC,
+               i2.id ASC
+             LIMIT 1
+           ) AS current_invoice_month
+         FROM invoices summary
+         GROUP BY summary.customer_id
+       ) b ON b.customer_id = c.id
        ${where}
-       ORDER BY id DESC
+       ORDER BY c.id DESC
        LIMIT ? OFFSET ?`,
       [...params, safeLimit, offset]
     );
@@ -87,7 +150,68 @@ exports.getById = async (req, res) => {
     const { id } = req.params;
 
     const [rows] = await db.query(
-      "SELECT * FROM customers WHERE id = ? AND user_id = ? LIMIT 1",
+      `SELECT
+         c.*,
+         COALESCE(b.total_balance, 0) AS balance,
+         COALESCE(b.total_paid, 0) AS billing_paid_amount,
+         COALESCE(b.total_amount, 0) AS billing_total_amount,
+         COALESCE(b.total_balance, 0) AS billing_balance,
+         b.current_invoice_id,
+         b.current_invoice_status,
+         b.current_invoice_due_date,
+         b.current_invoice_month
+       FROM customers c
+       LEFT JOIN (
+         SELECT
+           summary.customer_id,
+           SUM(summary.amount) AS total_amount,
+           SUM(summary.paid_amount) AS total_paid,
+           SUM(summary.balance) AS total_balance,
+           (
+             SELECT i2.id
+             FROM invoices i2
+             WHERE i2.customer_id = summary.customer_id
+             ORDER BY
+               CASE WHEN i2.balance > 0 THEN 0 ELSE 1 END,
+               i2.due_date ASC,
+               i2.id ASC
+             LIMIT 1
+           ) AS current_invoice_id,
+           (
+             SELECT i2.status
+             FROM invoices i2
+             WHERE i2.customer_id = summary.customer_id
+             ORDER BY
+               CASE WHEN i2.balance > 0 THEN 0 ELSE 1 END,
+               i2.due_date ASC,
+               i2.id ASC
+             LIMIT 1
+           ) AS current_invoice_status,
+           (
+             SELECT i2.due_date
+             FROM invoices i2
+             WHERE i2.customer_id = summary.customer_id
+             ORDER BY
+               CASE WHEN i2.balance > 0 THEN 0 ELSE 1 END,
+               i2.due_date ASC,
+               i2.id ASC
+             LIMIT 1
+           ) AS current_invoice_due_date,
+           (
+             SELECT i2.invoice_month
+             FROM invoices i2
+             WHERE i2.customer_id = summary.customer_id
+             ORDER BY
+               CASE WHEN i2.balance > 0 THEN 0 ELSE 1 END,
+               i2.due_date ASC,
+               i2.id ASC
+             LIMIT 1
+           ) AS current_invoice_month
+         FROM invoices summary
+         GROUP BY summary.customer_id
+       ) b ON b.customer_id = c.id
+       WHERE c.id = ? AND c.user_id = ?
+       LIMIT 1`,
       [id, userId]
     );
 
@@ -164,6 +288,22 @@ exports.create = async (req, res) => {
     );
 
     const customerId = result.insertId;
+    await createPlanAndInitialInvoice(
+      connection,
+      {
+        id: customerId,
+        plan_type,
+        frequency,
+        plan_price,
+        start_date,
+      },
+      {
+        amount: advance_paid,
+        payment_date: start_date,
+        payment_mode: "advance",
+        notes: "Initial advance payment",
+      }
+    );
 
     await connection.query(
       `INSERT INTO service_visits
@@ -193,8 +333,11 @@ exports.create = async (req, res) => {
 };
 
 exports.update = async (req, res) => {
+  const connection = await db.getConnection();
+
   try {
     const userId = requireAuthenticatedUserId(req);
+    await connection.beginTransaction();
     const { id } = req.params;
     const {
       whatsapp_account_id = null,
@@ -221,7 +364,7 @@ exports.update = async (req, res) => {
     const balance = Number(plan_price) - Number(advance_paid || 0);
     const next_service_date = calculateNextServiceDate(start_date, frequency);
 
-    const [customerResult] = await db.query(
+    const [customerResult] = await connection.query(
       `UPDATE customers SET
          whatsapp_account_id = ?,
          name = ?,
@@ -270,10 +413,19 @@ exports.update = async (req, res) => {
     );
 
     if (customerResult.affectedRows === 0) {
+      await connection.rollback();
       return res.status(404).json({ message: "Customer not found" });
     }
 
-    await db.query(
+    await syncActivePlanFromCustomer(connection, {
+      id,
+      plan_type,
+      frequency,
+      plan_price,
+      start_date,
+    });
+
+    await connection.query(
       `UPDATE service_visits
        SET next_service_date = ?
        WHERE customer_id = ?
@@ -283,12 +435,16 @@ exports.update = async (req, res) => {
       [next_service_date, id]
     );
 
+    await connection.commit();
     res.json({ success: true });
   } catch (error) {
+    await connection.rollback();
     console.error("UPDATE ERROR:", error);
     res.status(error.statusCode || 500).json({
       message: error.message || "Server error",
     });
+  } finally {
+    connection.release();
   }
 };
 

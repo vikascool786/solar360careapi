@@ -13,6 +13,10 @@ function resolveCustomerType(body) {
   return body.customer_type || "customer";
 }
 
+function hasLocationCoordinates(body) {
+  return body.latitude !== undefined && body.longitude !== undefined;
+}
+
 exports.getAll = async (req, res) => {
   try {
     const userId = requireAuthenticatedUserId(req);
@@ -119,18 +123,22 @@ exports.create = async (req, res) => {
       kw = null,
       start_date,
       frequency: rawFrequency,
+      latitude = null,
+      longitude = null,
+      location_address = null,
     } = req.body;
     const frequency = normalizeFrequency(rawFrequency);
     const customer_type = resolveCustomerType(req.body);
     const customer_category = getCustomerCategory(req.body);
+    const shouldSetLocationUpdatedAt = hasLocationCoordinates(req.body);
 
     const balance = Number(plan_price) - Number(advance_paid || 0);
     const next_service_date = calculateNextServiceDate(start_date, frequency);
 
     const [result] = await connection.query(
       `INSERT INTO customers
-       (user_id, whatsapp_account_id, name, phone, address, area, plan_type, plan_price, advance_paid, kw, balance, start_date, next_service_date, frequency, customer_type, customer_category)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       (user_id, whatsapp_account_id, name, phone, address, area, plan_type, plan_price, advance_paid, kw, balance, start_date, next_service_date, frequency, customer_type, customer_category, latitude, longitude, location_address, location_updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ${shouldSetLocationUpdatedAt ? "NOW()" : "?"})`,
       [
         userId,
         whatsapp_account_id,
@@ -148,6 +156,10 @@ exports.create = async (req, res) => {
         frequency,
         customer_type,
         customer_category,
+        latitude,
+        longitude,
+        location_address,
+        ...(shouldSetLocationUpdatedAt ? [] : [null]),
       ]
     );
 
@@ -197,10 +209,14 @@ exports.update = async (req, res) => {
       start_date,
       frequency: rawFrequency,
       notes,
+      latitude = null,
+      longitude = null,
+      location_address = null,
     } = req.body;
     const frequency = normalizeFrequency(rawFrequency);
     const customer_type = resolveCustomerType(req.body);
     const customer_category = getCustomerCategory(req.body);
+    const shouldSetLocationUpdatedAt = hasLocationCoordinates(req.body);
 
     const balance = Number(plan_price) - Number(advance_paid || 0);
     const next_service_date = calculateNextServiceDate(start_date, frequency);
@@ -222,7 +238,11 @@ exports.update = async (req, res) => {
          frequency = ?,
          customer_type = ?,
          customer_category = ?,
-         notes = ?
+         notes = ?,
+         latitude = COALESCE(?, latitude),
+         longitude = COALESCE(?, longitude),
+         location_address = COALESCE(?, location_address),
+         location_updated_at = ${shouldSetLocationUpdatedAt ? "NOW()" : "location_updated_at"}
        WHERE id = ? AND user_id = ?`,
       [
         whatsapp_account_id,
@@ -241,6 +261,9 @@ exports.update = async (req, res) => {
         customer_type,
         customer_category,
         notes || null,
+        latitude,
+        longitude,
+        location_address,
         id,
         userId,
       ]
@@ -263,6 +286,41 @@ exports.update = async (req, res) => {
     res.json({ success: true });
   } catch (error) {
     console.error("UPDATE ERROR:", error);
+    res.status(error.statusCode || 500).json({
+      message: error.message || "Server error",
+    });
+  }
+};
+
+exports.updateLocation = async (req, res) => {
+  try {
+    const userId = requireAuthenticatedUserId(req);
+    const { id } = req.params;
+    const { latitude, longitude, location_address = null } = req.body;
+
+    if (!hasLocationCoordinates(req.body)) {
+      return res.status(400).json({
+        message: "latitude and longitude are required",
+      });
+    }
+
+    const [result] = await db.query(
+      `UPDATE customers
+       SET latitude = ?,
+           longitude = ?,
+           location_address = ?,
+           location_updated_at = NOW()
+       WHERE id = ? AND user_id = ?`,
+      [latitude, longitude, location_address, id, userId]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ message: "Customer not found" });
+    }
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error("LOCATION UPDATE ERROR:", error);
     res.status(error.statusCode || 500).json({
       message: error.message || "Server error",
     });

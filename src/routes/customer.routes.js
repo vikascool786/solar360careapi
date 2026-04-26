@@ -5,6 +5,7 @@ const controller = require('../controllers/customer.controller');
 router.get('/', controller.getAll);
 router.get('/:id', controller.getById);
 router.post('/', controller.create);
+router.patch('/:id/location', controller.updateLocation);
 router.put('/:id', controller.update);
 router.delete('/:id', controller.remove);
 

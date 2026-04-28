@@ -10,11 +10,33 @@ const {
 } = require("../services/billing.service");
 
 function getCustomerCategory(body) {
-  return body.customer_category ?? body["customer_category "] ?? null;
+  const explicitCategory =
+    body.customer_category ?? body["customer_category "] ?? null;
+
+  if (explicitCategory) {
+    return explicitCategory;
+  }
+
+  const rawType = body.customer_type;
+  if (rawType && !isValidCustomerType(rawType)) {
+    return rawType;
+  }
+
+  return null;
 }
 
 function resolveCustomerType(body) {
-  return body.customer_type || "customer";
+  const rawType = body.customer_type;
+
+  if (rawType && isValidCustomerType(rawType)) {
+    return rawType.trim().toLowerCase();
+  }
+
+  return "customer";
+}
+
+function isValidCustomerType(value) {
+  return ["lead", "customer"].includes(String(value).trim().toLowerCase());
 }
 
 function hasLocationCoordinates(body) {

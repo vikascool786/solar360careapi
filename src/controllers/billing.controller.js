@@ -1,6 +1,12 @@
 const db = require("../config/db");
 const { requireAuthenticatedUserId } = require("../utils/auth");
-const { recordPayment, withTransaction } = require("../services/billing.service");
+const {
+  decorateInvoicesForCollection,
+  formatDate,
+  recordPayment,
+  renewPaidCompletedPlanIfNeeded,
+  withTransaction,
+} = require("../services/billing.service");
 
 async function markOverdueInvoices(userId) {
   await db.query(
@@ -55,7 +61,8 @@ exports.getInvoices = async (req, res) => {
           c.area,
           cp.plan_type,
           cp.frequency,
-          cp.billing_cycle
+          cp.billing_cycle,
+          cp.start_date
        FROM invoices i
        JOIN customers c ON c.id = i.customer_id
        JOIN customer_plans cp ON cp.id = i.customer_plan_id
@@ -65,8 +72,10 @@ exports.getInvoices = async (req, res) => {
       [...params, limit, offset]
     );
 
+    const data = await decorateInvoicesForCollection(db, rows);
+
     res.json({
-      data: rows,
+      data,
       total: countRow.total,
       page,
       limit,
@@ -90,7 +99,8 @@ exports.getCustomerInvoices = async (req, res) => {
           i.*,
           cp.plan_type,
           cp.frequency,
-          cp.billing_cycle
+          cp.billing_cycle,
+          cp.start_date
        FROM invoices i
        JOIN customer_plans cp ON cp.id = i.customer_plan_id
        JOIN customers c ON c.id = i.customer_id
@@ -99,7 +109,9 @@ exports.getCustomerInvoices = async (req, res) => {
       [customer_id, userId]
     );
 
-    res.json(rows);
+    const data = await decorateInvoicesForCollection(db, rows);
+
+    res.json(data);
   } catch (error) {
     console.error(error);
     res.status(error.statusCode || 500).json({
@@ -151,18 +163,31 @@ exports.addPayment = async (req, res) => {
       return res.status(404).json({ message: "Invoice not found" });
     }
 
-    const updatedInvoice = await withTransaction((connection) =>
-      recordPayment(connection, invoice_id, {
+    const paymentDate = payment_date || formatDate(new Date());
+    const result = await withTransaction(async (connection) => {
+      const updatedInvoice = await recordPayment(connection, invoice_id, {
         amount,
-        payment_date,
+        payment_date: paymentDate,
         payment_mode,
         notes,
-      })
-    );
+      });
+      const renewal = await renewPaidCompletedPlanIfNeeded(
+        connection,
+        updatedInvoice.customer_id,
+        paymentDate
+      );
+
+      return {
+        invoice: updatedInvoice,
+        renewal,
+      };
+    });
 
     res.json({
       success: true,
-      invoice: updatedInvoice,
+      invoice: result.invoice,
+      renewal_invoice: result.renewal?.invoice || null,
+      next_service_date: result.renewal?.next_service_date || null,
     });
   } catch (error) {
     console.error(error);

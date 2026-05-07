@@ -6,6 +6,7 @@ const {
 } = require("../utils/serviceSchedule");
 const {
   createPlanAndInitialInvoice,
+  getCustomerBillingSummary,
   syncActivePlanFromCustomer,
 } = require("../services/billing.service");
 
@@ -60,8 +61,8 @@ exports.getAll = async (req, res) => {
     const params = [userId];
 
     if (search) {
-      where += " AND (c.name LIKE ? OR c.phone LIKE ?)";
-      params.push(`%${search}%`, `%${search}%`);
+      where += " AND (c.name LIKE ? OR c.phone LIKE ? OR c.address LIKE ?)";
+      params.push(`%${search}%`, `%${search}%`, `%${search}%`);
     }
 
     if (area) {
@@ -152,8 +153,26 @@ exports.getAll = async (req, res) => {
       [...params, safeLimit, offset]
     );
 
+    const data = await Promise.all(
+      rows.map(async (customer) => {
+        const billing = await getCustomerBillingSummary(db, customer.id);
+
+        return {
+          ...customer,
+          balance: billing.total_balance,
+          billing_paid_amount: billing.total_paid,
+          billing_total_amount: billing.total_amount,
+          billing_balance: billing.total_balance,
+          current_invoice_id: billing.current_invoice_id,
+          current_invoice_status: billing.current_invoice_status,
+          current_invoice_due_date: billing.current_invoice_due_date,
+          current_invoice_month: billing.current_invoice_month,
+        };
+      })
+    );
+
     res.json({
-      data: rows,
+      data,
       total,
       page,
       limit: safeLimit,
@@ -241,7 +260,19 @@ exports.getById = async (req, res) => {
       return res.status(404).json({ message: "Customer not found" });
     }
 
-    res.json(rows[0]);
+    const billing = await getCustomerBillingSummary(db, rows[0].id);
+
+    res.json({
+      ...rows[0],
+      balance: billing.total_balance,
+      billing_paid_amount: billing.total_paid,
+      billing_total_amount: billing.total_amount,
+      billing_balance: billing.total_balance,
+      current_invoice_id: billing.current_invoice_id,
+      current_invoice_status: billing.current_invoice_status,
+      current_invoice_due_date: billing.current_invoice_due_date,
+      current_invoice_month: billing.current_invoice_month,
+    });
   } catch (error) {
     console.error(error);
     res.status(error.statusCode || 500).json({
@@ -278,7 +309,7 @@ exports.create = async (req, res) => {
     const customer_category = getCustomerCategory(req.body);
     const shouldSetLocationUpdatedAt = hasLocationCoordinates(req.body);
 
-    const balance = Number(plan_price) - Number(advance_paid || 0);
+    const balance = Math.max(Number(plan_price) - Number(advance_paid || 0), 0);
     const next_service_date = calculateNextServiceDate(start_date, frequency);
 
     const [result] = await connection.query(
@@ -383,7 +414,22 @@ exports.update = async (req, res) => {
     const customer_category = getCustomerCategory(req.body);
     const shouldSetLocationUpdatedAt = hasLocationCoordinates(req.body);
 
-    const balance = Number(plan_price) - Number(advance_paid || 0);
+    const [[existingCustomer]] = await connection.query(
+      `SELECT advance_paid
+       FROM customers
+       WHERE id = ? AND user_id = ?
+       LIMIT 1`,
+      [id, userId]
+    );
+
+    if (!existingCustomer) {
+      await connection.rollback();
+      return res.status(404).json({ message: "Customer not found" });
+    }
+
+    const resolvedAdvancePaid =
+      advance_paid === undefined ? existingCustomer.advance_paid : advance_paid;
+    const balance = Math.max(Number(plan_price) - Number(resolvedAdvancePaid || 0), 0);
     const next_service_date = calculateNextServiceDate(start_date, frequency);
 
     const [customerResult] = await connection.query(
@@ -417,7 +463,7 @@ exports.update = async (req, res) => {
         area,
         plan_type,
         plan_price,
-        advance_paid,
+        resolvedAdvancePaid,
         kw,
         balance,
         start_date,
@@ -447,7 +493,7 @@ exports.update = async (req, res) => {
       start_date,
     });
 
-    await connection.query(
+    const [visitUpdate] = await connection.query(
       `UPDATE service_visits
        SET next_service_date = ?
        WHERE customer_id = ?
@@ -456,6 +502,15 @@ exports.update = async (req, res) => {
        LIMIT 1`,
       [next_service_date, id]
     );
+
+    if (visitUpdate.affectedRows === 0) {
+      await connection.query(
+        `INSERT INTO service_visits
+         (customer_id, visit_date, status, next_service_date, reminder_sent)
+         VALUES (?, ?, 'pending', ?, 0)`,
+        [id, null, next_service_date]
+      );
+    }
 
     await connection.commit();
     res.json({ success: true });

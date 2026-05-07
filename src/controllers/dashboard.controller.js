@@ -1,5 +1,6 @@
 const db = require("../config/db");
 const { requireAuthenticatedUserId } = require("../utils/auth");
+const { decorateInvoicesForCollection } = require("../services/billing.service");
 
 async function queryOrFallback(query, params, fallbackQuery, fallbackParams = params) {
   try {
@@ -30,58 +31,83 @@ async function markOverdueInvoices(userId) {
 
 async function getBillingKpis(userId, totalCustomerCount) {
   try {
-    const [[billingKpis]] = await db.query(
+    const [[paymentKpis]] = await db.query(
       `SELECT
-         COALESCE(p.total_income, 0) AS totalIncome,
-         COALESCE(p.total_paid_this_month, 0) AS totalPaidThisMonth,
-         COALESCE(i.total_invoice_amount, 0) AS totalInvoiceAmount,
-         COALESCE(i.total_pending_amount, 0) AS totalPendingAmount,
-         COALESCE(i.overdue_amount, 0) AS overdueAmount,
-         COALESCE(i.pending_payment_invoices, 0) AS pendingPaymentInvoices,
-         COALESCE(i.overdue_invoices, 0) AS overdueInvoices,
-         COALESCE(i.partial_invoices, 0) AS partialInvoices,
-         COALESCE(i.paid_invoices, 0) AS paidInvoices,
-         COALESCE(i.total_invoices, 0) AS totalInvoices,
-         COALESCE(i.pending_customers, 0) AS pendingCustomers
-       FROM
-         (
-           SELECT
-             COALESCE(SUM(p.amount), 0) AS total_income,
-             COALESCE(SUM(
-               CASE
-                 WHEN p.payment_date >= DATE_FORMAT(CURDATE(), '%Y-%m-01')
-                  AND p.payment_date < DATE_ADD(DATE_FORMAT(CURDATE(), '%Y-%m-01'), INTERVAL 1 MONTH)
-                 THEN p.amount
-                 ELSE 0
-               END
-             ), 0) AS total_paid_this_month
-           FROM payments p
-           JOIN customers c ON c.id = p.customer_id
-           WHERE c.user_id = ?
-         ) p
-       CROSS JOIN
-         (
-           SELECT
-             COALESCE(SUM(i.amount), 0) AS total_invoice_amount,
-             COALESCE(SUM(CASE WHEN i.balance > 0 THEN i.balance ELSE 0 END), 0) AS total_pending_amount,
-             COALESCE(SUM(CASE WHEN i.status = 'overdue' AND i.balance > 0 THEN i.balance ELSE 0 END), 0) AS overdue_amount,
-             SUM(CASE WHEN i.balance > 0 THEN 1 ELSE 0 END) AS pending_payment_invoices,
-             SUM(CASE WHEN i.status = 'overdue' AND i.balance > 0 THEN 1 ELSE 0 END) AS overdue_invoices,
-             SUM(CASE WHEN i.status = 'partial' THEN 1 ELSE 0 END) AS partial_invoices,
-             SUM(CASE WHEN i.status = 'paid' THEN 1 ELSE 0 END) AS paid_invoices,
-             COUNT(i.id) AS total_invoices,
-             COUNT(DISTINCT CASE WHEN i.balance > 0 THEN i.customer_id END) AS pending_customers
-           FROM invoices i
-           JOIN customers c ON c.id = i.customer_id
-           WHERE c.user_id = ?
-         ) i`,
-      [userId, userId]
+         COALESCE(SUM(p.amount), 0) AS totalIncome,
+         COALESCE(SUM(
+           CASE
+             WHEN p.payment_date >= DATE_FORMAT(CURDATE(), '%Y-%m-01')
+              AND p.payment_date < DATE_ADD(DATE_FORMAT(CURDATE(), '%Y-%m-01'), INTERVAL 1 MONTH)
+             THEN p.amount
+             ELSE 0
+           END
+         ), 0) AS totalPaidThisMonth
+       FROM payments p
+       JOIN customers c ON c.id = p.customer_id
+       WHERE c.user_id = ?`,
+      [userId]
     );
 
-    const pendingCustomers = Number(billingKpis.pendingCustomers || 0);
+    const [invoiceRows] = await db.query(
+      `SELECT
+          i.*,
+          cp.plan_type,
+          cp.frequency,
+          cp.billing_cycle,
+          cp.start_date
+       FROM invoices i
+       JOIN customers c ON c.id = i.customer_id
+       JOIN customer_plans cp ON cp.id = i.customer_plan_id
+       WHERE c.user_id = ?`,
+      [userId]
+    );
+
+    const decoratedInvoices = await decorateInvoicesForCollection(
+      db,
+      invoiceRows
+    );
+    const collectibleInvoices = decoratedInvoices.filter(
+      (invoice) => Number(invoice.is_collectible || 0) === 1
+    );
+    const pendingInvoices = collectibleInvoices.filter(
+      (invoice) => Number(invoice.balance || 0) > 0
+    );
+    const pendingCustomerIds = new Set(
+      pendingInvoices.map((invoice) => invoice.customer_id)
+    );
+
+    const pendingCustomers = pendingCustomerIds.size;
 
     return {
-      ...billingKpis,
+      totalIncome: paymentKpis.totalIncome || 0,
+      totalPaidThisMonth: paymentKpis.totalPaidThisMonth || 0,
+      totalInvoiceAmount: collectibleInvoices.reduce(
+        (sum, invoice) => sum + Number(invoice.amount || 0),
+        0
+      ),
+      totalPendingAmount: pendingInvoices.reduce(
+        (sum, invoice) => sum + Number(invoice.balance || 0),
+        0
+      ),
+      overdueAmount: pendingInvoices.reduce(
+        (sum, invoice) =>
+          invoice.status === "overdue"
+            ? sum + Number(invoice.balance || 0)
+            : sum,
+        0
+      ),
+      pendingPaymentInvoices: pendingInvoices.length,
+      overdueInvoices: pendingInvoices.filter(
+        (invoice) => invoice.status === "overdue"
+      ).length,
+      partialInvoices: collectibleInvoices.filter(
+        (invoice) => invoice.status === "partial"
+      ).length,
+      paidInvoices: collectibleInvoices.filter(
+        (invoice) => invoice.status === "paid"
+      ).length,
+      totalInvoices: decoratedInvoices.length,
+      pendingCustomers,
       paidCustomers: Math.max(Number(totalCustomerCount || 0) - pendingCustomers, 0),
     };
   } catch (error) {

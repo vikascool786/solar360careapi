@@ -5,6 +5,7 @@ const {
   canScheduleAnotherVisit,
 } = require("../utils/serviceSchedule");
 const {
+  ensureInvoicesForCompletedServices,
   formatDate,
   renewPaidPlanForNextCycle,
 } = require("../services/billing.service");
@@ -334,6 +335,10 @@ exports.completeService = async (req, res) => {
        WHERE id = ?`,
       [completedDate, id]
     );
+    const generatedBillingInvoices = await ensureInvoicesForCompletedServices(
+      connection,
+      customer.id
+    );
 
     const nextDate = calculateNextServiceDate(
       visit.next_service_date || completedDate,
@@ -418,6 +423,7 @@ exports.completeService = async (req, res) => {
           ? "Service completed and next visit scheduled"
           : "Service completed and plan limit reached",
       next_service_date: nextServiceDate,
+      generated_billing_invoices: generatedBillingInvoices,
       renewal_invoice: renewedBilling?.invoice || null,
     });
   } catch (error) {

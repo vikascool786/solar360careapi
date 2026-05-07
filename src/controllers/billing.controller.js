@@ -2,6 +2,7 @@ const db = require("../config/db");
 const { requireAuthenticatedUserId } = require("../utils/auth");
 const {
   decorateInvoicesForCollection,
+  ensureInvoicesForCompletedServices,
   formatDate,
   recordPayment,
   renewPaidCompletedPlanIfNeeded,
@@ -93,6 +94,17 @@ exports.getCustomerInvoices = async (req, res) => {
     const userId = requireAuthenticatedUserId(req);
     await markOverdueInvoices(userId);
     const { customer_id } = req.params;
+
+    const [[customer]] = await db.query(
+      "SELECT id FROM customers WHERE id = ? AND user_id = ? LIMIT 1",
+      [customer_id, userId]
+    );
+
+    if (!customer) {
+      return res.status(404).json({ message: "Customer not found" });
+    }
+
+    await ensureInvoicesForCompletedServices(db, customer_id);
 
     const [rows] = await db.query(
       `SELECT

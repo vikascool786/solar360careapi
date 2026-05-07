@@ -52,6 +52,17 @@ function getBillingCycle(planType) {
   return "yearly";
 }
 
+function hasPlanBillingChange(existingPlan, nextPlan) {
+  const nextBillingCycle = getBillingCycle(nextPlan.plan_type);
+
+  return (
+    String(existingPlan.plan_type || "") !== String(nextPlan.plan_type || "") ||
+    String(existingPlan.frequency || "") !== String(nextPlan.frequency || "") ||
+    Number(existingPlan.plan_price || 0) !== Number(nextPlan.plan_price || 0) ||
+    String(existingPlan.billing_cycle || "") !== String(nextBillingCycle || "")
+  );
+}
+
 function getNextBillingDate(dateValue, billingCycle, frequency = null) {
   if (billingCycle === "monthly") {
     return addMonths(dateValue, 1);
@@ -174,6 +185,8 @@ async function decorateInvoicesForCollection(connection, invoices) {
 }
 
 async function getCustomerBillingSummary(connection, customerId) {
+  await ensureInvoicesForCompletedServices(connection, customerId);
+
   const [invoices] = await connection.query(
     `SELECT
         i.*,
@@ -296,6 +309,76 @@ async function createNextInvoiceForPlan(connection, plan) {
   );
 
   return invoice;
+}
+
+async function ensureInvoicesForCompletedServices(connection, customerId) {
+  const [[plan]] = await connection.query(
+    `SELECT *
+     FROM customer_plans
+     WHERE customer_id = ? AND status = 'active'
+     ORDER BY id DESC
+     LIMIT 1`,
+    [customerId]
+  );
+
+  if (!plan || plan.billing_cycle === "one_time") {
+    return [];
+  }
+
+  const completedVisits = await getCompletedVisitCountForPlan(connection, plan);
+  const visitsPerCycle = getVisitsPerBillingCycle(
+    plan.frequency,
+    plan.billing_cycle
+  );
+  const requiredInvoiceCount = Math.max(
+    1,
+    Math.ceil(completedVisits / visitsPerCycle)
+  );
+
+  const [existingInvoices] = await connection.query(
+    `SELECT *
+     FROM invoices
+     WHERE customer_plan_id = ?
+     ORDER BY invoice_month ASC, id ASC`,
+    [plan.id]
+  );
+
+  if (existingInvoices.length >= requiredInvoiceCount) {
+    return [];
+  }
+
+  const createdInvoices = [];
+  let invoiceDate = plan.start_date;
+
+  for (let index = 0; index < requiredInvoiceCount; index += 1) {
+    if (index >= existingInvoices.length) {
+      const invoice = await createInvoiceIfMissing(connection, plan, invoiceDate);
+      createdInvoices.push(invoice);
+    }
+
+    invoiceDate = getNextBillingDate(
+      invoiceDate,
+      plan.billing_cycle,
+      plan.frequency
+    );
+  }
+
+  const currentNextBillingDate = parseDateValue(plan.next_billing_date);
+  const ensuredNextBillingDate = parseDateValue(invoiceDate);
+
+  if (
+    ensuredNextBillingDate &&
+    (!currentNextBillingDate || ensuredNextBillingDate > currentNextBillingDate)
+  ) {
+    await connection.query(
+      `UPDATE customer_plans
+       SET next_billing_date = ?
+       WHERE id = ?`,
+      [invoiceDate, plan.id]
+    );
+  }
+
+  return createdInvoices;
 }
 
 async function recalculateInvoice(connection, invoiceId) {
@@ -710,6 +793,27 @@ async function syncActivePlanFromCustomer(connection, customer) {
   const plan = plans[0];
   const billingCycle = getBillingCycle(customer.plan_type);
 
+  if (hasPlanBillingChange(plan, customer)) {
+    await connection.query(
+      `UPDATE customer_plans
+       SET status = 'expired'
+       WHERE id = ?`,
+      [plan.id]
+    );
+
+    const newPlan = await createPlanAndInitialInvoice(connection, customer);
+
+    await connection.query(
+      `UPDATE customers
+       SET advance_paid = 0,
+           balance = ?
+       WHERE id = ?`,
+      [Number(customer.plan_price || 0), customer.id]
+    );
+
+    return newPlan;
+  }
+
   await connection.query(
     `UPDATE customer_plans
      SET plan_type = ?,
@@ -750,6 +854,7 @@ async function withTransaction(callback) {
 module.exports = {
   createPlanAndInitialInvoice,
   decorateInvoicesForCollection,
+  ensureInvoicesForCompletedServices,
   formatDate,
   getCustomerBillingSummary,
   getBillingCycle,

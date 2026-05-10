@@ -7,6 +7,7 @@ router.post("/generate-from-customers", serviceController.generateVisitsFromCust
 router.post("/create", serviceController.createServiceVisit);
 router.post("/:id/complete", serviceController.completeService);
 router.put("/:id/reschedule", serviceController.rescheduleService);
+router.delete("/:id", serviceController.deleteServiceVisit);
 router.post("/plan", serviceController.createPlanVisits);
 router.get("/:customer_id", serviceController.getServiceVisits);
 

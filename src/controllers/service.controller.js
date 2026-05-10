@@ -494,6 +494,70 @@ exports.rescheduleService = async (req, res) => {
   }
 };
 
+exports.deleteServiceVisit = async (req, res) => {
+  const connection = await db.getConnection();
+
+  try {
+    const userId = requireAuthenticatedUserId(req);
+    const { id } = req.params;
+
+    await connection.beginTransaction();
+
+    const [visits] = await connection.query(
+      `SELECT sv.id, sv.customer_id
+       FROM service_visits sv
+       JOIN customers c ON c.id = sv.customer_id
+       WHERE sv.id = ? AND c.user_id = ?
+       LIMIT 1`,
+      [id, userId]
+    );
+
+    if (!visits.length) {
+      await connection.rollback();
+      return res.status(404).json({ message: "Visit not found" });
+    }
+
+    const visit = visits[0];
+
+    await connection.query("DELETE FROM service_visits WHERE id = ?", [id]);
+
+    const [openRows] = await connection.query(
+      `SELECT next_service_date
+       FROM service_visits
+       WHERE customer_id = ?
+         AND status NOT IN ('completed', 'skipped')
+       ORDER BY next_service_date ASC, id ASC
+       LIMIT 1`,
+      [visit.customer_id]
+    );
+
+    const nextServiceDate = openRows[0]?.next_service_date || null;
+
+    await connection.query(
+      `UPDATE customers
+       SET next_service_date = ?
+       WHERE id = ? AND user_id = ?`,
+      [nextServiceDate, visit.customer_id, userId]
+    );
+
+    await connection.commit();
+
+    res.json({
+      success: true,
+      message: "Service visit deleted",
+      next_service_date: nextServiceDate,
+    });
+  } catch (error) {
+    await connection.rollback();
+    console.error(error);
+    res.status(error.statusCode || 500).json({
+      error: error.message || "Failed to delete service visit",
+    });
+  } finally {
+    connection.release();
+  }
+};
+
 exports.createPlanVisits = async (req, res) => {
   try {
     const userId = requireAuthenticatedUserId(req);

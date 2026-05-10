@@ -7,6 +7,7 @@ const {
 const {
   ensureInvoicesForCompletedServices,
   formatDate,
+  getBillingCycle,
   renewPaidPlanForNextCycle,
 } = require("../services/billing.service");
 
@@ -99,6 +100,7 @@ exports.generateVisitsFromCustomers = async (req, res) => {
     let customerWhere = `
       WHERE c.user_id = ?
         AND COALESCE(c.customer_type, 'customer') = 'customer'
+        AND LOWER(REPLACE(c.plan_type, '-', ' ')) <> 'one time'
         AND c.start_date IS NOT NULL
         AND c.frequency IS NOT NULL
     `;
@@ -363,6 +365,7 @@ exports.completeService = async (req, res) => {
     );
 
     const shouldCreateNextVisit =
+      getBillingCycle(customer.plan_type) !== "one_time" &&
       !openRows.length &&
       canScheduleAnotherVisit({
         frequency: customer.frequency,

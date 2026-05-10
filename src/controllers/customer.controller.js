@@ -6,6 +6,7 @@ const {
 } = require("../utils/serviceSchedule");
 const {
   createPlanAndInitialInvoice,
+  getBillingCycle,
   getCustomerBillingSummary,
   syncActivePlanFromCustomer,
 } = require("../services/billing.service");
@@ -42,6 +43,51 @@ function isValidCustomerType(value) {
 
 function hasLocationCoordinates(body) {
   return body.latitude !== undefined && body.longitude !== undefined;
+}
+
+function isOneTimePlan(planType) {
+  return getBillingCycle(planType) === "one_time";
+}
+
+function getDateOnly(value) {
+  if (!value) {
+    return "";
+  }
+
+  if (value instanceof Date) {
+    const year = value.getFullYear();
+    const month = String(value.getMonth() + 1).padStart(2, "0");
+    const day = String(value.getDate()).padStart(2, "0");
+    return `${year}-${month}-${day}`;
+  }
+
+  return String(value).slice(0, 10);
+}
+
+async function getNextServiceDateForUpdate(
+  connection,
+  { customerId, startDate, frequency, scheduleChanged, currentNextServiceDate }
+) {
+  if (!scheduleChanged && currentNextServiceDate) {
+    return currentNextServiceDate;
+  }
+
+  const [[latestCompletedVisit]] = await connection.query(
+    `SELECT visit_date, next_service_date
+     FROM service_visits
+     WHERE customer_id = ?
+       AND status = 'completed'
+     ORDER BY COALESCE(visit_date, next_service_date) DESC, id DESC
+     LIMIT 1`,
+    [customerId]
+  );
+
+  const baseDate =
+    latestCompletedVisit?.visit_date ||
+    latestCompletedVisit?.next_service_date ||
+    startDate;
+
+  return calculateNextServiceDate(baseDate, frequency);
 }
 
 exports.getAll = async (req, res) => {
@@ -310,7 +356,9 @@ exports.create = async (req, res) => {
     const shouldSetLocationUpdatedAt = hasLocationCoordinates(req.body);
 
     const balance = Math.max(Number(plan_price) - Number(advance_paid || 0), 0);
-    const next_service_date = calculateNextServiceDate(start_date, frequency);
+    const next_service_date = isOneTimePlan(plan_type)
+      ? null
+      : calculateNextServiceDate(start_date, frequency);
 
     const [result] = await connection.query(
       `INSERT INTO customers
@@ -365,12 +413,14 @@ exports.create = async (req, res) => {
       [customerId, start_date, start_date]
     );
 
-    await connection.query(
-      `INSERT INTO service_visits
-       (customer_id, visit_date, status, next_service_date, reminder_sent)
-       VALUES (?, ?, 'pending', ?, 0)`,
-      [customerId, null, next_service_date]
-    );
+    if (next_service_date) {
+      await connection.query(
+        `INSERT INTO service_visits
+         (customer_id, visit_date, status, next_service_date, reminder_sent)
+         VALUES (?, ?, 'pending', ?, 0)`,
+        [customerId, null, next_service_date]
+      );
+    }
 
     await connection.commit();
     res.json({ success: true, customerId });
@@ -415,7 +465,7 @@ exports.update = async (req, res) => {
     const shouldSetLocationUpdatedAt = hasLocationCoordinates(req.body);
 
     const [[existingCustomer]] = await connection.query(
-      `SELECT advance_paid
+      `SELECT advance_paid, start_date, frequency, next_service_date
        FROM customers
        WHERE id = ? AND user_id = ?
        LIMIT 1`,
@@ -430,7 +480,18 @@ exports.update = async (req, res) => {
     const resolvedAdvancePaid =
       advance_paid === undefined ? existingCustomer.advance_paid : advance_paid;
     const balance = Math.max(Number(plan_price) - Number(resolvedAdvancePaid || 0), 0);
-    const next_service_date = calculateNextServiceDate(start_date, frequency);
+    const scheduleChanged =
+      getDateOnly(existingCustomer.start_date) !== getDateOnly(start_date) ||
+      String(existingCustomer.frequency || "") !== String(frequency || "");
+    const next_service_date = isOneTimePlan(plan_type)
+      ? null
+      : await getNextServiceDateForUpdate(connection, {
+          customerId: id,
+          startDate: start_date,
+          frequency,
+          scheduleChanged,
+          currentNextServiceDate: existingCustomer.next_service_date,
+        });
 
     const [customerResult] = await connection.query(
       `UPDATE customers SET
@@ -493,22 +554,31 @@ exports.update = async (req, res) => {
       start_date,
     });
 
-    const [visitUpdate] = await connection.query(
-      `UPDATE service_visits
-       SET next_service_date = ?
-       WHERE customer_id = ?
-       AND status = 'pending'
-       ORDER BY id DESC
-       LIMIT 1`,
-      [next_service_date, id]
-    );
+    if (next_service_date) {
+      const [visitUpdate] = await connection.query(
+        `UPDATE service_visits
+         SET next_service_date = ?
+         WHERE customer_id = ?
+         AND status = 'pending'
+         ORDER BY id DESC
+         LIMIT 1`,
+        [next_service_date, id]
+      );
 
-    if (visitUpdate.affectedRows === 0) {
+      if (visitUpdate.affectedRows === 0) {
+        await connection.query(
+          `INSERT INTO service_visits
+           (customer_id, visit_date, status, next_service_date, reminder_sent)
+           VALUES (?, ?, 'pending', ?, 0)`,
+          [id, null, next_service_date]
+        );
+      }
+    } else {
       await connection.query(
-        `INSERT INTO service_visits
-         (customer_id, visit_date, status, next_service_date, reminder_sent)
-         VALUES (?, ?, 'pending', ?, 0)`,
-        [id, null, next_service_date]
+        `DELETE FROM service_visits
+         WHERE customer_id = ?
+           AND status = 'pending'`,
+        [id]
       );
     }
 

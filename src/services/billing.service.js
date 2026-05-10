@@ -52,17 +52,6 @@ function getBillingCycle(planType) {
   return "yearly";
 }
 
-function hasPlanBillingChange(existingPlan, nextPlan) {
-  const nextBillingCycle = getBillingCycle(nextPlan.plan_type);
-
-  return (
-    String(existingPlan.plan_type || "") !== String(nextPlan.plan_type || "") ||
-    String(existingPlan.frequency || "") !== String(nextPlan.frequency || "") ||
-    Number(existingPlan.plan_price || 0) !== Number(nextPlan.plan_price || 0) ||
-    String(existingPlan.billing_cycle || "") !== String(nextBillingCycle || "")
-  );
-}
-
 function getNextBillingDate(dateValue, billingCycle, frequency = null) {
   if (billingCycle === "monthly") {
     return addMonths(dateValue, 1);
@@ -245,6 +234,19 @@ async function getCustomerBillingSummary(connection, customerId) {
 async function createInvoiceIfMissing(connection, plan, invoiceDate) {
   const invoiceMonth = getInvoiceMonth(invoiceDate);
   const amount = Number(plan.plan_price || 0);
+
+  const [existingCustomerMonthRows] = await connection.query(
+    `SELECT *
+     FROM invoices
+     WHERE customer_id = ? AND invoice_month = ?
+     ORDER BY id ASC
+     LIMIT 1`,
+    [plan.customer_id, invoiceMonth]
+  );
+
+  if (existingCustomerMonthRows.length) {
+    return existingCustomerMonthRows[0];
+  }
 
   const [existingRows] = await connection.query(
     `SELECT *
@@ -439,6 +441,109 @@ async function recalculateInvoice(connection, invoiceId) {
   );
 
   return updatedInvoice;
+}
+
+async function syncInvoiceAmount(connection, invoiceId, amount) {
+  const [[invoice]] = await connection.query(
+    "SELECT * FROM invoices WHERE id = ? LIMIT 1",
+    [invoiceId]
+  );
+
+  if (!invoice) {
+    return null;
+  }
+
+  const [[paymentTotals]] = await connection.query(
+    `SELECT COALESCE(SUM(amount), 0) AS paid_amount
+     FROM payments
+     WHERE invoice_id = ?`,
+    [invoiceId]
+  );
+
+  const nextAmount = Number(amount || 0);
+  const paidAmount = Number(paymentTotals.paid_amount || 0);
+  const balance = Math.max(nextAmount - paidAmount, 0);
+  const status = getInvoiceStatus({
+    paidAmount,
+    balance,
+    dueDate: invoice.due_date,
+  });
+
+  await connection.query(
+    `UPDATE invoices
+     SET amount = ?,
+         paid_amount = ?,
+         balance = ?,
+         status = ?
+     WHERE id = ?`,
+    [nextAmount, paidAmount, balance, status, invoiceId]
+  );
+
+  const [[updatedInvoice]] = await connection.query(
+    "SELECT * FROM invoices WHERE id = ? LIMIT 1",
+    [invoiceId]
+  );
+
+  return updatedInvoice;
+}
+
+async function syncEditableInvoicesForPlan(connection, planId, amount) {
+  const [invoices] = await connection.query(
+    `SELECT id
+     FROM invoices
+     WHERE customer_plan_id = ?
+       AND status <> 'paid'
+     ORDER BY invoice_month ASC, id ASC`,
+    [planId]
+  );
+
+  for (const invoice of invoices) {
+    await syncInvoiceAmount(connection, invoice.id, amount);
+  }
+}
+
+async function removeUnpaidDuplicateInactiveInvoices(connection, customerId, activePlanId) {
+  await connection.query(
+    `DELETE i
+     FROM invoices i
+     JOIN customer_plans cp ON cp.id = i.customer_plan_id
+     JOIN invoices active_i
+       ON active_i.customer_id = i.customer_id
+      AND active_i.invoice_month = i.invoice_month
+      AND active_i.customer_plan_id = ?
+     WHERE i.customer_id = ?
+       AND i.customer_plan_id <> ?
+       AND cp.status <> 'active'
+       AND i.paid_amount = 0`,
+    [activePlanId, customerId, activePlanId]
+  );
+}
+
+async function getNextBillingDateForEditedPlan(connection, planId, customer, billingCycle) {
+  if (billingCycle === "one_time") {
+    return null;
+  }
+
+  const startDate = customer.start_date || formatDate(new Date());
+  const [[invoiceCountRow]] = await connection.query(
+    `SELECT COUNT(*) AS invoice_count
+     FROM invoices
+     WHERE customer_plan_id = ?`,
+    [planId]
+  );
+
+  let nextBillingDate = startDate;
+  const invoiceCount = Math.max(Number(invoiceCountRow.invoice_count || 0), 1);
+
+  for (let index = 0; index < invoiceCount; index += 1) {
+    nextBillingDate = getNextBillingDate(
+      nextBillingDate,
+      billingCycle,
+      customer.frequency
+    );
+  }
+
+  return nextBillingDate;
 }
 
 async function getOldestOpenInvoiceForPlan(connection, planId) {
@@ -792,27 +897,12 @@ async function syncActivePlanFromCustomer(connection, customer) {
 
   const plan = plans[0];
   const billingCycle = getBillingCycle(customer.plan_type);
-
-  if (hasPlanBillingChange(plan, customer)) {
-    await connection.query(
-      `UPDATE customer_plans
-       SET status = 'expired'
-       WHERE id = ?`,
-      [plan.id]
-    );
-
-    const newPlan = await createPlanAndInitialInvoice(connection, customer);
-
-    await connection.query(
-      `UPDATE customers
-       SET advance_paid = 0,
-           balance = ?
-       WHERE id = ?`,
-      [Number(customer.plan_price || 0), customer.id]
-    );
-
-    return newPlan;
-  }
+  const nextBillingDate = await getNextBillingDateForEditedPlan(
+    connection,
+    plan.id,
+    customer,
+    billingCycle
+  );
 
   await connection.query(
     `UPDATE customer_plans
@@ -820,7 +910,8 @@ async function syncActivePlanFromCustomer(connection, customer) {
          frequency = ?,
          plan_price = ?,
          billing_cycle = ?,
-         start_date = ?
+         start_date = ?,
+         next_billing_date = ?
      WHERE id = ?`,
     [
       customer.plan_type,
@@ -828,11 +919,20 @@ async function syncActivePlanFromCustomer(connection, customer) {
       customer.plan_price,
       billingCycle,
       customer.start_date,
+      nextBillingDate,
       plan.id,
     ]
   );
 
-  return plan;
+  await syncEditableInvoicesForPlan(connection, plan.id, customer.plan_price);
+  await removeUnpaidDuplicateInactiveInvoices(connection, customer.id, plan.id);
+
+  const [[updatedPlan]] = await connection.query(
+    "SELECT * FROM customer_plans WHERE id = ? LIMIT 1",
+    [plan.id]
+  );
+
+  return updatedPlan;
 }
 
 async function withTransaction(callback) {

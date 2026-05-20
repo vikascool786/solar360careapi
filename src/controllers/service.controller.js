@@ -21,10 +21,17 @@ exports.getAllVisits = async (req, res) => {
     const search = req.query.search || "";
     const area = req.query.area || "";
     const status = req.query.status || "pending";
+    const date = req.query.date || "";
     const orderDirection = status === "all" ? "DESC" : "ASC";
 
     let where = "WHERE c.user_id = ?";
     const params = [userId];
+
+    if (date && !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      return res.status(400).json({
+        message: "Date must be in YYYY-MM-DD format",
+      });
+    }
 
     if (status === "all") {
       where += " AND sv.status IN ('pending', 'completed')";
@@ -45,6 +52,11 @@ exports.getAllVisits = async (req, res) => {
     if (area) {
       where += " AND c.area = ?";
       params.push(area);
+    }
+
+    if (date) {
+      where += " AND DATE(sv.next_service_date) = ?";
+      params.push(date);
     }
 
     const [countRows] = await db.query(

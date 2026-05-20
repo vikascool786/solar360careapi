@@ -132,6 +132,16 @@ exports.getAll = async (req, res) => {
     );
     const total = countRows[0].total;
 
+    const [registeredCustomerRows] = await db.query(
+      `SELECT COUNT(*) as total_registered_customers
+       FROM customers
+       WHERE user_id = ?
+         AND COALESCE(customer_type, 'customer') = 'customer'`,
+      [userId]
+    );
+    const totalRegisteredCustomers =
+      registeredCustomerRows[0].total_registered_customers;
+
     const [rows] = await db.query(
       `SELECT
          c.*,
@@ -220,6 +230,7 @@ exports.getAll = async (req, res) => {
     res.json({
       data,
       total,
+      total_registered_customers: totalRegisteredCustomers,
       page,
       limit: safeLimit,
     });
